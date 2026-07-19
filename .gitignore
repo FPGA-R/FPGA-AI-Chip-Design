@@ -1,0 +1,32 @@
+# Vivado工程临时文件、缓存
+*.bit
+*.bin
+*.jou
+*.log
+*.pb
+*.rpt
+*.str
+*.txt
+*.wdb
+*.xil
+*.zip
+*.backup
+.cache/
+hw/
+sim/
+srcs/
+runs/
+ip_user_files/
+gen/
+reports/
+*.xpr
+vivado*.backup
+
+# 仿真输出文件夹
+sim_1/
+synth_1/
+impl_1/
+
+# 系统生成垃圾文件
+.DS_Store
+Thumbs.db
