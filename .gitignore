@@ -26,6 +26,16 @@ impl_1/
 .webtalk/
 *.hw/
 
+# Python缓存（model_opt目录代码补充）
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.out
+
 # 开发IDE配置文件
 .vscode/
 .idea/
