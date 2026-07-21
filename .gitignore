@@ -1,4 +1,4 @@
-# Vivado工程临时文件、缓存
+# Vivado工程临时文件、缓存文件
 *.bit
 *.bin
 *.jou
@@ -6,27 +6,30 @@
 *.pb
 *.rpt
 *.str
-*.txt
 *.wdb
 *.xil
 *.zip
+*.xpr
+vivado*.backup
 *.backup
+
+# Vivado自动生成目录
 .cache/
 hw/
-sim/
-srcs/
 runs/
 ip_user_files/
 gen/
 reports/
-*.xpr
-vivado*.backup
-
-# 仿真输出文件夹
 sim_1/
 synth_1/
 impl_1/
+.webtalk/
+*.hw/
 
-# 系统生成垃圾文件
+# 开发IDE配置文件
+.vscode/
+.idea/
+
+# 操作系统垃圾文件
 .DS_Store
 Thumbs.db
