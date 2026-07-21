@@ -10,15 +10,18 @@
 - 编程语言：Verilog HDL、Python
 
 ## 仓库目录说明
-- **src/**：FPGA硬件Verilog源代码
-- **sim/**：仿真测试激励Testbench
-- **constraints/**：开发板时钟、引脚约束文件 board.xdc
-- **model_opt/**：网络搭建、模型训练、INT8定点量化代码
-- **scripts/**：自动化脚本
-  - data_gen.py：仿真测试数据生成
+- **src/**：FPGA硬件Verilog源代码，存放顶层模块与各个功能硬件模块
+- **sim/**：仿真测试激励Testbench，存放各个模块仿真文件
+- **constraints/**：开发板时钟、引脚约束文件（board.xdc）
+- **model_opt/**：网络搭建、模型训练、INT8量化相关Python代码
+- **scripts/**：各类自动化辅助脚本
+  - data_gen.py：仿真测试数据生成脚本
   - vivado_build.tcl：一键构建Vivado工程脚本
-- **docs/**：项目申报材料、设计文档、实验报告
-- **img/**：系统框图、仿真波形、硬件实物照片
+- **docs/**：项目全部文档资料
+  - meeting_notes/：小组例会会议记录
+  - design_report.md：硬件设计报告
+  - 申报书_初稿.pdf：大创申报材料
+- **img/**：系统架构框图、仿真波形截图、硬件实物照片
 
 ## 团队分工（4人）
 A：算法模型方向。负责模型训练、网络轻量化、INT8量化，生成仿真测试数据，提供软件参考结果。
