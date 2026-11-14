@@ -1,4 +1,724 @@
-#mac_int8.v
+uart_calculator.v
+
+`timescale 1ns / 1ps
+
+// ============================================================
+// 顶层模块：纯PL UART 8位加减法 + INT8 MAC
+//
+// UART参数：115200 baud, 8 data bits, 1 stop bit
+//
+// 请求帧：A5 OP A B
+// OP=01：A+B
+// OP=02：A-B
+// OP=03：MAC累加器清零
+// OP=04：ACC = ACC + A*B
+//
+// 加减法响应：5A OP RESULT_H RESULT_L（4字节）
+// MAC响应：5A OP ACC[31:24] ACC[23:16]
+//              ACC[15:8] ACC[7:0]（6字节）
+// ============================================================
+
+module uart_calculator #(
+    parameter integer CLK_FREQ = 100_000_000,
+    parameter integer BAUD_RATE = 115200
+)(
+    input  wire clk_100m,
+    input  wire rst_n,
+    input  wire uart_rx,
+    output wire uart_tx
+);
+
+    localparam integer CLKS_PER_BIT = CLK_FREQ / BAUD_RATE;
+
+    // --------------------------------------------------------
+    // UART接收模块
+    // --------------------------------------------------------
+
+    wire [7:0] rx_data;
+    wire       rx_valid;
+
+    uart_rx_module #(
+        .CLKS_PER_BIT(CLKS_PER_BIT)
+    ) u_uart_rx (
+        .clk      (clk_100m),
+        .rst_n    (rst_n),
+        .uart_rx  (uart_rx),
+        .rx_data  (rx_data),
+        .rx_valid (rx_valid)
+    );
+
+    // --------------------------------------------------------
+    // UART发送模块
+    // --------------------------------------------------------
+
+    wire       tx_start;
+    wire [7:0] tx_data;
+    wire       tx_busy;
+
+    uart_tx_module #(
+        .CLKS_PER_BIT(CLKS_PER_BIT)
+    ) u_uart_tx (
+        .clk      (clk_100m),
+        .rst_n    (rst_n),
+        .tx_start (tx_start),
+        .tx_data  (tx_data),
+        .uart_tx  (uart_tx),
+        .tx_busy  (tx_busy)
+    );
+
+    // --------------------------------------------------------
+    // 指令解析状态机
+    // --------------------------------------------------------
+
+    localparam CMD_HEADER = 2'd0;
+    localparam CMD_OPCODE = 2'd1;
+    localparam CMD_A      = 2'd2;
+    localparam CMD_B      = 2'd3;
+
+    reg [1:0] cmd_state;
+
+    reg [7:0] opcode_reg;
+    reg [7:0] operand_a;
+
+    // 9位减法结果，支持-255到255
+    wire [8:0] sub_result;
+
+    assign sub_result =
+        {1'b0, operand_a} - {1'b0, rx_data};
+
+    // --------------------------------------------------------
+    // MAC模块
+    // --------------------------------------------------------
+
+    wire signed [31:0] mac_acc;
+    wire               mac_acc_valid;
+
+    wire mac_en;
+    wire mac_clear;
+
+    // 只有完整接收到一帧的最后一个字节时，
+    // 才触发一次MAC操作或清零操作
+    assign mac_en =
+        (rsp_state == RSP_IDLE) &&
+        rx_valid &&
+        (cmd_state == CMD_B) &&
+        (opcode_reg == 8'h04);
+
+    assign mac_clear =
+        (rsp_state == RSP_IDLE) &&
+        rx_valid &&
+        (cmd_state == CMD_B) &&
+        (opcode_reg == 8'h03);
+
+    mac_int8 u_mac_int8 (
+        .clk       (clk_100m),
+        .rst_n     (rst_n),
+        .clear     (mac_clear),
+        .en        (mac_en),
+        .a         (operand_a),
+        .b         (rx_data),
+        .acc       (mac_acc),
+        .acc_valid (mac_acc_valid)
+    );
+
+    // --------------------------------------------------------
+    // 运算结果寄存器
+    // --------------------------------------------------------
+
+    reg [31:0] result_reg;
+    reg [7:0]  response_opcode;
+
+    // --------------------------------------------------------
+    // 响应发送状态机
+    // --------------------------------------------------------
+
+    localparam RSP_IDLE      = 3'd0;
+    localparam RSP_SEND      = 3'd1;
+    localparam RSP_WAIT_BUSY = 3'd2;
+    localparam RSP_WAIT_DONE = 3'd3;
+    localparam RSP_MAC_WAIT  = 3'd4;
+
+    reg [2:0] rsp_state;
+    reg [2:0] rsp_index;
+
+    // 根据发送索引选择响应帧中的字节
+    reg [7:0] tx_data_select;
+
+    
+always @(*) begin
+
+    // MAC响应：6字节
+    if ((response_opcode == 8'h03) ||
+        (response_opcode == 8'h04)) begin
+
+        case (rsp_index)
+            3'd0: tx_data_select = 8'h5A;
+            3'd1: tx_data_select = response_opcode;
+            3'd2: tx_data_select = result_reg[31:24];
+            3'd3: tx_data_select = result_reg[23:16];
+            3'd4: tx_data_select = result_reg[15:8];
+            3'd5: tx_data_select = result_reg[7:0];
+            default: tx_data_select = 8'h00;
+        endcase
+
+    end
+
+    // 加减法响应：4字节
+    else begin
+
+        case (rsp_index)
+            3'd0: tx_data_select = 8'h5A;
+            3'd1: tx_data_select = response_opcode;
+            3'd2: tx_data_select = result_reg[15:8];
+            3'd3: tx_data_select = result_reg[7:0];
+            default: tx_data_select = 8'h00;
+        endcase
+
+    end
+
+end
+
+
+    assign tx_data = tx_data_select;
+
+    // 发送状态机处于SEND且TX空闲时，启动一次发送
+    assign tx_start =
+        (rsp_state == RSP_SEND) && (!tx_busy);
+
+    // --------------------------------------------------------
+    // 主控制逻辑
+    // --------------------------------------------------------
+
+    always @(posedge clk_100m or negedge rst_n) begin
+
+        if (!rst_n) begin
+
+            cmd_state       <= CMD_HEADER;
+            opcode_reg      <= 8'h00;
+            operand_a       <= 8'h00;
+
+            result_reg      <= 32'h00000000;
+            response_opcode <= 8'h00;
+
+            rsp_state       <= RSP_IDLE;
+            rsp_index       <= 3'd0;
+
+        end
+
+        else begin
+
+            // ================================================
+            // 第一部分：接收和解析请求帧
+            // ================================================
+
+            if ((rsp_state == RSP_IDLE) && rx_valid) begin
+
+                case (cmd_state)
+
+                    // 等待帧头 A5
+                    CMD_HEADER: begin
+
+                        if (rx_data == 8'hA5) begin
+                            cmd_state <= CMD_OPCODE;
+                        end
+
+                    end
+
+                    // 接收运算指令
+                    CMD_OPCODE: begin
+
+                        opcode_reg <= rx_data;
+                        cmd_state  <= CMD_A;
+
+                    end
+
+                    // 接收操作数A
+                    CMD_A: begin
+
+                        operand_a <= rx_data;
+                        cmd_state <= CMD_B;
+
+                    end
+
+                    // 接收操作数B并执行运算
+                    CMD_B: begin
+
+                        cmd_state <= CMD_HEADER;
+
+                        // -------------------------------
+                        // 原有8位加法
+                        // -------------------------------
+
+                        if (opcode_reg == 8'h01) begin
+
+                            result_reg <= {
+                                16'h0000,
+                                ({1'b0, operand_a} +
+                                 {1'b0, rx_data})
+                            };
+
+                            response_opcode <= 8'h01;
+
+                            rsp_index <= 3'd0;
+                            rsp_state <= RSP_SEND;
+
+                        end
+
+                        // -------------------------------
+                        // 原有8位减法
+                        // -------------------------------
+
+                        else if (opcode_reg == 8'h02) begin
+
+                            result_reg <= {
+                                {16{sub_result[8]}},
+                                {{7{sub_result[8]}}, sub_result}
+                            };
+
+                            response_opcode <= 8'h02;
+
+                            rsp_index <= 3'd0;
+                            rsp_state <= RSP_SEND;
+
+                        end
+
+                        // -------------------------------
+                        // MAC清零或乘加
+                        // -------------------------------
+
+                        else if ((opcode_reg == 8'h03) ||
+                                 (opcode_reg == 8'h04)) begin
+
+                            response_opcode <= opcode_reg;
+
+                            rsp_index <= 3'd0;
+
+                            // 等待MAC完成更新，再读取累加结果
+                            rsp_state <= RSP_MAC_WAIT;
+
+                        end
+
+                        else begin
+
+                            // 不支持的指令，丢弃本帧
+                            cmd_state <= CMD_HEADER;
+
+                        end
+
+                    end
+
+                    default: begin
+                        cmd_state <= CMD_HEADER;
+                    end
+
+                endcase
+
+            end
+
+            // ================================================
+            // 第二部分：发送响应
+            // ================================================
+
+            case (rsp_state)
+
+                RSP_IDLE: begin
+                    // 等待完整请求帧
+                end
+
+                // MAC操作完成后读取累加器
+                RSP_MAC_WAIT: begin
+
+                    result_reg <= mac_acc;
+
+                    rsp_index <= 3'd0;
+                    rsp_state <= RSP_SEND;
+
+                end
+
+                RSP_SEND: begin
+
+                    if (!tx_busy) begin
+                        // tx_start同时有效，TX在本时钟沿接收数据
+                        rsp_state <= RSP_WAIT_BUSY;
+                    end
+
+                end
+
+                RSP_WAIT_BUSY: begin
+
+                    if (tx_busy) begin
+                        rsp_state <= RSP_WAIT_DONE;
+                    end
+
+                end
+
+                RSP_WAIT_DONE: begin
+
+                    if (!tx_busy) begin
+
+                        // MAC清零和乘加响应共6字节
+                        // 加减法响应共4字节
+                        if (((response_opcode == 8'h03) ||
+                             (response_opcode == 8'h04)) &&
+                             (rsp_index == 3'd5)) begin
+
+                            rsp_state <= RSP_IDLE;
+
+                        end
+
+                        else if (((response_opcode == 8'h01) ||
+                                  (response_opcode == 8'h02)) &&
+                                  (rsp_index == 3'd3)) begin
+
+                            rsp_state <= RSP_IDLE;
+
+                        end
+
+                        else begin
+
+                            rsp_index <= rsp_index + 1'b1;
+                            rsp_state <= RSP_SEND;
+
+                        end
+
+                    end
+
+                end
+
+                default: begin
+                    rsp_state <= RSP_IDLE;
+                end
+
+            endcase
+
+        end
+
+    end
+
+endmodule
+
+
+
+// ============================================================
+// UART接收模块
+// 115200 baud, 8N1
+// ============================================================
+
+module uart_rx_module #(
+    parameter integer CLKS_PER_BIT = 868
+)(
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       uart_rx,
+
+    output reg  [7:0] rx_data,
+    output reg        rx_valid
+);
+
+    localparam IDLE  = 2'd0;
+    localparam START = 2'd1;
+    localparam DATA  = 2'd2;
+    localparam STOP  = 2'd3;
+
+    reg [1:0] state;
+    reg [15:0] clk_count;
+    reg [2:0] bit_index;
+
+    reg [7:0] rx_shift;
+
+    // 两级同步器
+    reg rx_sync1;
+    reg rx_sync2;
+
+    always @(posedge clk or negedge rst_n) begin
+
+        if (!rst_n) begin
+
+            rx_sync1 <= 1'b1;
+            rx_sync2 <= 1'b1;
+
+        end
+        else begin
+
+            rx_sync1 <= uart_rx;
+            rx_sync2 <= rx_sync1;
+
+        end
+
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+
+        if (!rst_n) begin
+
+            state     <= IDLE;
+            clk_count <= 0;
+            bit_index <= 0;
+            rx_shift  <= 0;
+            rx_data   <= 0;
+            rx_valid  <= 0;
+
+        end
+        else begin
+
+            rx_valid <= 1'b0;
+
+            case (state)
+
+                IDLE: begin
+
+                    clk_count <= 0;
+                    bit_index <= 0;
+
+                    if (rx_sync2 == 1'b0) begin
+                        state <= START;
+                    end
+
+                end
+
+                START: begin
+
+                    if (clk_count == (CLKS_PER_BIT / 2 - 1)) begin
+
+                        clk_count <= 0;
+
+                        if (rx_sync2 == 1'b0) begin
+                            state <= DATA;
+                        end
+                        else begin
+                            state <= IDLE;
+                        end
+
+                    end
+                    else begin
+
+                        clk_count <= clk_count + 1'b1;
+
+                    end
+
+                end
+
+                DATA: begin
+
+                    if (clk_count == CLKS_PER_BIT - 1) begin
+
+                        clk_count <= 0;
+
+                        // UART低位先传输
+                        rx_shift[bit_index] <= rx_sync2;
+
+                        if (bit_index == 3'd7) begin
+
+                            bit_index <= 0;
+                            state <= STOP;
+
+                        end
+                        else begin
+
+                            bit_index <= bit_index + 1'b1;
+
+                        end
+
+                    end
+                    else begin
+
+                        clk_count <= clk_count + 1'b1;
+
+                    end
+
+                end
+
+                STOP: begin
+
+                    if (clk_count == CLKS_PER_BIT - 1) begin
+
+                        clk_count <= 0;
+                        state <= IDLE;
+
+                        if (rx_sync2 == 1'b1) begin
+
+                            rx_data  <= rx_shift;
+                            rx_valid <= 1'b1;
+
+                        end
+
+                    end
+                    else begin
+
+                        clk_count <= clk_count + 1'b1;
+
+                    end
+
+                end
+
+                default: begin
+
+                    state <= IDLE;
+                    clk_count <= 0;
+
+                end
+
+            endcase
+
+        end
+
+    end
+
+endmodule
+
+
+// ============================================================
+// UART发送模块
+// 115200 baud, 8N1
+// ============================================================
+
+module uart_tx_module #(
+    parameter integer CLKS_PER_BIT = 868
+)(
+    input  wire       clk,
+    input  wire       rst_n,
+
+    input  wire       tx_start,
+    input  wire [7:0] tx_data,
+
+    output reg        uart_tx,
+    output wire       tx_busy
+);
+
+    localparam IDLE  = 2'd0;
+    localparam START = 2'd1;
+    localparam DATA  = 2'd2;
+    localparam STOP  = 2'd3;
+
+    reg [1:0] state;
+    reg [15:0] clk_count;
+    reg [2:0] bit_index;
+    reg [7:0] tx_shift;
+
+    assign tx_busy = (state != IDLE);
+
+    always @(posedge clk or negedge rst_n) begin
+
+        if (!rst_n) begin
+
+            state     <= IDLE;
+            clk_count <= 0;
+            bit_index <= 0;
+            tx_shift  <= 0;
+            uart_tx   <= 1'b1;
+
+        end
+        else begin
+
+            case (state)
+
+                IDLE: begin
+
+                    uart_tx   <= 1'b1;
+                    clk_count <= 0;
+                    bit_index <= 0;
+
+                    if (tx_start) begin
+
+                        tx_shift <= tx_data;
+                        uart_tx  <= 1'b0;
+                        state    <= START;
+
+                    end
+
+                end
+
+                START: begin
+
+                    if (clk_count == CLKS_PER_BIT - 1) begin
+
+                        clk_count <= 0;
+                        bit_index <= 0;
+
+                        uart_tx <= tx_shift[0];
+                        state   <= DATA;
+
+                    end
+                    else begin
+
+                        clk_count <= clk_count + 1'b1;
+
+                    end
+
+                end
+
+                DATA: begin
+
+                    if (clk_count == CLKS_PER_BIT - 1) begin
+
+                        clk_count <= 0;
+
+                        if (bit_index == 3'd7) begin
+
+                            uart_tx <= 1'b1;
+                            state   <= STOP;
+
+                        end
+                        else begin
+
+                            bit_index <= bit_index + 1'b1;
+                            uart_tx <= tx_shift[bit_index + 1'b1];
+
+                        end
+
+                    end
+                    else begin
+
+                        clk_count <= clk_count + 1'b1;
+
+                    end
+
+                end
+
+                STOP: begin
+
+                    if (clk_count == CLKS_PER_BIT - 1) begin
+
+                        clk_count <= 0;
+                        state <= IDLE;
+
+                    end
+                    else begin
+
+                        clk_count <= clk_count + 1'b1;
+
+                    end
+
+                end
+
+                default: begin
+
+                    state <= IDLE;
+                    uart_tx <= 1'b1;
+                    clk_count <= 0;
+
+                end
+
+            endcase
+
+        end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+mac_int8.v
+
 module mac_int8 (
     input  wire               clk,
     input  wire               rst_n,
@@ -44,32 +764,36 @@ module mac_int8 (
 endmodule
 
 
-#tb_mac int8.v
+
+
+
+
+
+
+
+
+
+tb_uart_mac.v
 
 `timescale 1ns / 1ps
 
-module tb_mac_int8;
+module tb_uart_mac;
+
+    localparam integer CLKS_PER_BIT = 868;
 
     reg clk;
     reg rst_n;
-    reg clear;
-    reg en;
-    reg signed [7:0] a;
-    reg signed [7:0] b;
+    reg uart_rx;
+    wire uart_tx;
 
-    wire signed [31:0] acc;
-    wire acc_valid;
+    reg [7:0] rx_byte;
 
-    // 实例化 MAC 模块
-    mac_int8 uut (
-        .clk(clk),
-        .rst_n(rst_n),
-        .clear(clear),
-        .en(en),
-        .a(a),
-        .b(b),
-        .acc(acc),
-        .acc_valid(acc_valid)
+    // 被测试的完整顶层模块
+    uart_calculator uut (
+        .clk_100m (clk),
+        .rst_n    (rst_n),
+        .uart_rx  (uart_rx),
+        .uart_tx  (uart_tx)
     );
 
     // 100MHz时钟，周期10ns
@@ -78,57 +802,316 @@ module tb_mac_int8;
         forever #5 clk = ~clk;
     end
 
+    // ------------------------------------------------
+    // 模拟电脑向FPGA发送一个UART字节
+    // ------------------------------------------------
+    task send_byte;
+        input [7:0] data;
+        integer i;
+        begin
+            @(negedge clk);
+            uart_rx = 1'b0;  // 起始位
+
+            repeat(CLKS_PER_BIT)
+                @(negedge clk);
+
+            for (i = 0; i < 8; i = i + 1) begin
+                uart_rx = data[i];
+
+                repeat(CLKS_PER_BIT)
+                    @(negedge clk);
+            end
+
+            uart_rx = 1'b1;  // 停止位
+
+            repeat(CLKS_PER_BIT)
+                @(negedge clk);
+        end
+    endtask
+
+    // ------------------------------------------------
+    // 发送最后一个字节，提前返回以便接收FPGA响应
+    // ------------------------------------------------
+    task send_last_byte;
+        input [7:0] data;
+        integer i;
+        begin
+            @(negedge clk);
+            uart_rx = 1'b0;
+
+            repeat(CLKS_PER_BIT)
+                @(negedge clk);
+
+            for (i = 0; i < 8; i = i + 1) begin
+                uart_rx = data[i];
+
+                repeat(CLKS_PER_BIT)
+                    @(negedge clk);
+            end
+
+            uart_rx = 1'b1;
+
+            // 只等待半个停止位，不错过FPGA响应起始位
+            repeat(CLKS_PER_BIT/2)
+                @(negedge clk);
+        end
+    endtask
+    // ------------------------------------------------
+    // 模拟电脑接收FPGA返回的一个UART字节
+    // ------------------------------------------------
+  
+task receive_byte;
+    output [7:0] data;
+    integer i;
+    begin
+        // 等待发送起始位
+        @(negedge uart_tx);
+
+        $display("RX start detected at %0t ns", $time);
+
+        // 等待1.5个波特周期
+        repeat(CLKS_PER_BIT + CLKS_PER_BIT/2)
+            @(posedge clk);
+
+        #1;
+
+        // 采样8个数据位
+        for (i = 0; i < 8; i = i + 1) begin
+
+            data[i] = uart_tx;
+
+            $display("  bit[%0d] = %b, time = %0t ns",
+                     i, data[i], $time);
+
+            repeat(CLKS_PER_BIT)
+                @(posedge clk);
+
+            #1;
+        end
+        
+        
+
+        // 检查停止位
+        $display("  STOP = %b, time = %0t ns",
+                 uart_tx, $time);
+
+        if (uart_tx !== 1'b1) begin
+            $display("ERROR: UART stop bit error!");
+            $display("Received data = %02h", data);
+            $display("Simulation time = %0t ns", $time);
+            $stop;
+        end
+        else begin
+            $display("PASS: UART stop bit");
+        end
+    end
+endtask
+
+        // ------------------------------------------------
+    // 检查4字节响应
+    // ------------------------------------------------
+    task check4;
+        input [7:0] e0, e1, e2, e3;
+        reg [7:0] d0, d1, d2, d3;
+        begin
+            receive_byte(d0);
+            receive_byte(d1);
+            receive_byte(d2);
+            receive_byte(d3);
+
+            $display("RX: %02h %02h %02h %02h",
+                     d0, d1, d2, d3);
+
+            if ((d0 !== e0) || (d1 !== e1) ||
+                (d2 !== e2) || (d3 !== e3)) begin
+                $display("ERROR: 4-byte response mismatch!");
+                $stop;
+            end
+            else begin
+                $display("PASS: 4-byte response");
+            end
+        end
+    endtask
+
+    // ------------------------------------------------
+    // 检查6字节响应
+    // ------------------------------------------------
+    task check6;
+        input [7:0] e0, e1, e2, e3, e4, e5;
+        reg [7:0] d0, d1, d2, d3, d4, d5;
+        begin
+            receive_byte(d0);
+            receive_byte(d1);
+            receive_byte(d2);
+            receive_byte(d3);
+            receive_byte(d4);
+            receive_byte(d5);
+
+            $display("RX: %02h %02h %02h %02h %02h %02h",
+                     d0, d1, d2, d3, d4, d5);
+
+            if ((d0 !== e0) || (d1 !== e1) ||
+                (d2 !== e2) || (d3 !== e3) ||
+                (d4 !== e4) || (d5 !== e5)) begin
+                $display("ERROR: 6-byte response mismatch!");
+                $stop;
+            end
+            else begin
+                $display("PASS: 6-byte response");
+            end
+        end
+    endtask
+
+    // ------------------------------------------------
+    // 测试流程
+    // ------------------------------------------------
     initial begin
-        rst_n = 0;
-        clear = 0;
-        en = 0;
-        a = 0;
-        b = 0;
+
+        rst_n   = 0;
+        uart_rx = 1;
 
         // 复位
-        #20;
+        repeat(20)
+            @(negedge clk);
+
         rst_n = 1;
 
-        // 清零累加器
-        @(negedge clk);
-        clear = 1;
-        @(negedge clk);
-        clear = 0;
+        repeat(100)
+            @(negedge clk);
 
-        // 第一次：2 * 3 = 6
-        a = 8'sd2;
-        b = 8'sd3;
-        en = 1;
-        @(negedge clk);
+        // ==========================================
+        // 测试1：原有加法
+        // 0x12 + 0x34 = 0x0046
+        // ==========================================
 
-        // 第二次：4 * 5 = 20，累计26
-        a = 8'sd4;
-        b = 8'sd5;
-        @(negedge clk);
+        $display("TEST 1: ADD");
 
-        // 第三次：3 * 2 = 6，累计32
-        a = 8'sd3;
-        b = 8'sd2;
-        @(negedge clk);
+        send_byte(8'hA5);
+        send_byte(8'h01);
+        send_byte(8'h12);
+        send_last_byte(8'h34);
 
-        en = 0;
+check4(8'h5A, 8'h01, 8'h00, 8'h46);
 
-        // 负数测试：-2 * 3 = -6
-        a = -8'sd2;
-        b = 8'sd3;
-        en = 1;
-        @(negedge clk);
+        // ==========================================
+        // 测试2：原有减法
+        // 0x12 - 0x34 = -34 = 0xFFDE
+        // ==========================================
 
-        en = 0;
-        #10;
+$display("TEST 2: SUB");
 
-        // 清零测试
-        clear = 1;
-        #10;
-        clear = 0;
+send_byte(8'hA5);
+send_byte(8'h02);
+send_byte(8'h12);
+send_last_byte(8'h34);
 
-        #30;
+check4(8'h5A, 8'h02, 8'hFF, 8'hDE);
+        // ==========================================
+        // 测试3：MAC清零
+        // ==========================================
+
+        $display("TEST 3: MAC CLEAR");
+
+        send_byte(8'hA5);
+        send_byte(8'h03);
+        send_byte(8'h00);
+        send_last_byte(8'h00);
+
+        check6(8'h5A, 8'h03,
+              8'h00, 8'h00, 8'h00, 8'h00);
+
+        // ==========================================
+        // 测试4：0 + 2*3 = 6
+        // ==========================================
+
+        $display("TEST 4: MAC 2*3");
+
+        send_byte(8'hA5);
+        send_byte(8'h04);
+        send_byte(8'h02);
+        send_last_byte(8'h03);
+
+        check6(8'h5A, 8'h04,
+              8'h00, 8'h00, 8'h00, 8'h06);
+
+        // ==========================================
+        // 测试5：6 + 4*5 = 26
+        // ==========================================
+
+        $display("TEST 5: MAC 4*5");
+
+        send_byte(8'hA5);
+        send_byte(8'h04);
+        send_byte(8'h04);
+        send_last_byte(8'h05);
+
+        check6(8'h5A, 8'h04,
+              8'h00, 8'h00, 8'h00, 8'h1A);
+
+        // ==========================================
+        // 测试6：26 + 3*2 = 32
+        // ==========================================
+
+        $display("TEST 6: MAC 3*2");
+
+        send_byte(8'hA5);
+        send_byte(8'h04);
+        send_byte(8'h03);
+        send_last_byte(8'h02);
+
+        check6(8'h5A, 8'h04,
+              8'h00, 8'h00, 8'h00, 8'h20);
+
+        // ==========================================
+        // 测试7：32 + (-2)*3 = 26
+        // -2的INT8补码为FE
+        // ==========================================
+
+        $display("TEST 7: MAC -2*3");
+
+        send_byte(8'hA5);
+        send_byte(8'h04);
+        send_byte(8'hFE);
+        send_last_byte(8'h03);
+
+        check6(8'h5A, 8'h04,
+              8'h00, 8'h00, 8'h00, 8'h1A);
+
+        $display("--------------------------------");
+        $display("ALL UART + MAC TESTS PASSED!");
+        $display("--------------------------------");
+
+        #1000;
         $finish;
+
     end
 
 endmodule
+
+
+
+
+
+
+
+
+
+
+
+
+xdc.xdc
+# 100MHz 时钟
+create_clock -name clk_100m -period 10 [get_ports clk_100m]
+set_property PACKAGE_PIN C8 [get_ports clk_100m]
+set_property IOSTANDARD LVCMOS18 [get_ports clk_100m]
+
+# 复位
+set_property PACKAGE_PIN H13 [get_ports rst_n]
+set_property IOSTANDARD LVCMOS18 [get_ports rst_n]
+
+# FEP UART：默认 3.3V
+# B22 UART_TXD -> AF15 -> FPGA uart_rx
+# B23 UART_RXD -> AF14 -> FPGA uart_tx
+set_property PACKAGE_PIN AF14 [get_ports uart_tx]
+set_property PACKAGE_PIN AF15 [get_ports uart_rx]
+set_property IOSTANDARD LVCMOS33 [get_ports {uart_tx uart_rx}]
